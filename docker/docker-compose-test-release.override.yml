@@ -1,0 +1,6 @@
+services:
+  main:
+    volumes:
+      - /data/qiweidoc/.env:/var/www/.env:ro
+  wxfinance:
+    image: qiweidoc-wxfinance:test-20260918
