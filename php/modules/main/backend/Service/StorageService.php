@@ -3,6 +3,7 @@
 namespace Modules\Main\Service;
 
 use Aws\S3\S3Client;
+use Aws\S3\MultipartUploader;
 use Carbon\Carbon;
 use Common\Yii;
 use Exception;
@@ -132,7 +133,17 @@ class StorageService
      */
     public static function removeExpiredLocalFile(StorageModel $model): void
     {
-        if (!$model->get('is_deleted_local') && $model->get('local_storage_expired_at') < now() && !empty($model->get('cloud_storage_setting_id'))) {
+        if (getenv('QIWEIDOC_LOCAL_PURGE_ENABLED') !== '1') {
+            return;
+        }
+
+        if (!$model->get('is_deleted_local') && $model->get('local_storage_expired_at')
+            && $model->get('local_storage_expired_at') < now()
+            && $model->get('cloud_storage_setting_id') && $model->get('cloud_storage_object_key')) {
+            $setting = CloudStorageSettingModel::query()->where(['id' => $model->get('cloud_storage_setting_id')])->getOne();
+            if (!$setting || !self::getCloudS3Client($setting)->doesObjectExistV2($setting->get('bucket'), $model->get('cloud_storage_object_key'))) {
+                throw new Exception('云端对象不可访问，保留本地文件');
+            }
             $s3Client = self::getLocalS3Client();
             $s3Client->deleteObject([
                 'Bucket' => $model->get('local_storage_bucket'),
@@ -149,56 +160,134 @@ class StorageService
      */
     public static function saveCloud(StorageModel $model): void
     {
-        /* @var CloudStorageSettingModel $cloudStorageSetting */
+        if ($model->get('cloud_storage_setting_id') && $model->get('cloud_storage_object_key')) {
+            return;
+        }
+
         $cloudStorageSetting = CloudStorageSettingModel::query()->orderBy(['id' => SORT_DESC])->getOne();
         if (empty($cloudStorageSetting)) {
             return;
         }
 
-        Yii::logger()->info("开始上传文件到云存储", ['id' => $model->get('id'), 'original_filename' => $model->get('original_filename')]);
-
-        // 用mc注册本地配置
-        $endpoint = Yii::params()['local-storage']['endpoint'];
-        $accessKey = Yii::params()['local-storage']['access_key'];
-        $secretKey = Yii::params()['local-storage']['secret_key'];
-        $bucket = $model->get('local_storage_bucket');
-        $objectKey = $model->get('local_storage_object_key');
-        $command = "mc alias set local {$endpoint} {$accessKey} {$secretKey} --path auto";
-        exec($command, $output, $return);
-        if ($return != 0) {
-            throw new Exception($output[0] ?? 'access_key不合法');
-        }
-
-        // 用mc注册云存储配置
-        $cloudEndpoint = $cloudStorageSetting->get('endpoint');
-        $cloudAccessKey = $cloudStorageSetting->get('access_key');
-        $cloudSecretKey = $cloudStorageSetting->get('secret_key');
+        $localBucket = $model->get('local_storage_bucket');
+        $localKey = $model->get('local_storage_object_key');
         $cloudBucket = $cloudStorageSetting->get('bucket');
-        $cloudObjectKey = self::generateObjectKey($model->get('original_filename'), $model->get('hash'));
-
-        // MinIO特殊配置
-        $path = "off";
-        if ($cloudStorageSetting->get('provider') == 'MinIO') {
-            $path = "auto";
+        $size = (int)$model->get('file_size');
+        $savedHash = strtolower((string)$model->get('hash'));
+        if (!preg_match('/^[a-f0-9]{32}$/', $savedHash) || $size < 0) {
+            throw new Exception('存储记录缺少合法 MD5 或文件大小');
         }
-        $command = "mc alias set cloud {$cloudEndpoint} {$cloudAccessKey} $cloudSecretKey --path {$path}";
-        exec($command, $output, $return);
-        if ($return != 0) {
-            throw new Exception($output[0] ?? 'access_key不合法');
+        $cloudClient = self::getCloudS3Client($cloudStorageSetting);
+        $savedHashKey = sprintf('content/md5/%s/%s', substr($savedHash, 0, 2), $savedHash);
+        $verified = StorageModel::query()->where([
+            'hash' => $model->get('hash'),
+            'file_size' => $size,
+            'cloud_storage_setting_id' => $cloudStorageSetting->get('id'),
+            'cloud_storage_object_key' => $savedHashKey,
+        ])->getOne();
+        if ($verified !== null) {
+            $head = $cloudClient->headObject(['Bucket' => $cloudBucket, 'Key' => $savedHashKey]);
+            if ((int)$head['ContentLength'] !== $size) {
+                throw new Exception('已复用云端对象的大小不一致，停止关联');
+            }
+            $model->update([
+                'cloud_storage_setting_id' => $cloudStorageSetting->get('id'),
+                'cloud_storage_object_key' => $savedHashKey,
+            ]);
+            return;
         }
 
-        // 利用minio复制本地对象到云存储
-        $command = "mc cp 'local/{$bucket}/{$objectKey}' 'cloud/{$cloudBucket}/{$cloudObjectKey}'";
-        exec($command, $output, $return);
-        if ($return != 0) {
-            throw new Exception($output[0] ?? '复制对象失败');
+        // 旧版分片上传曾把 ETag 前段写入 hash。该字段也被消息引用，不能改写；
+        // 云端键必须使用源文件逐字节计算出的真实 MD5。
+        $actualHash = $savedHash;
+        if (!$model->get('is_deleted_local')) {
+            $localClient = self::getLocalS3Client();
+            $sourceHead = $localClient->headObject(['Bucket' => $localBucket, 'Key' => $localKey]);
+            if ((int)$sourceHead['ContentLength'] !== $size) {
+                throw new Exception('本地对象大小与数据库不一致，停止云端复制');
+            }
+            [$actualHash, $sourceSize] = self::hashObject($localClient, $localBucket, $localKey);
+            if ($sourceSize !== $size) {
+                throw new Exception('本地对象读取大小与数据库不一致，停止云端复制');
+            }
+        }
+        $cloudObjectKey = sprintf('content/md5/%s/%s', substr($actualHash, 0, 2), $actualHash);
+        $uploaded = false;
+        if (!$cloudClient->doesObjectExistV2($cloudBucket, $cloudObjectKey)) {
+            if ($model->get('is_deleted_local')) {
+                throw new Exception('本地对象已删除，不能重新复制到云端');
+            }
+            $source = $localClient->getObject(['Bucket' => $localBucket, 'Key' => $localKey]);
+            $body = $source['Body'];
+            try {
+                $mime = $model->get('mime_type') ?: 'application/octet-stream';
+                if ($size >= 16 * 1024 * 1024) {
+                    (new MultipartUploader($cloudClient, $body, [
+                        'bucket' => $cloudBucket,
+                        'key' => $cloudObjectKey,
+                        'part_size' => 16 * 1024 * 1024,
+                        'concurrency' => 2,
+                        'before_initiate' => static function ($command) use ($mime): void {
+                            $command['ContentType'] = $mime;
+                        },
+                    ]))->upload();
+                } else {
+                    $cloudClient->putObject([
+                        'Bucket' => $cloudBucket,
+                        'Key' => $cloudObjectKey,
+                        'Body' => $body,
+                        'ContentLength' => $size,
+                        'ContentType' => $mime,
+                    ]);
+                }
+                $uploaded = true;
+            } finally {
+                $body->close();
+            }
         }
 
-        // 更新数据库
+        // 分片 ETag 不是文件 MD5；回读云端对象并逐块计算哈希，校验通过后才记账。
+        try {
+            [$copiedHash, $copiedSize] = self::hashObject($cloudClient, $cloudBucket, $cloudObjectKey);
+            if ($copiedSize !== $size || $copiedHash !== $actualHash) {
+                throw new Exception('云端对象校验失败，未更新数据库');
+            }
+        } catch (Throwable $error) {
+            if ($uploaded) {
+                try {
+                    $cloudClient->deleteObject(['Bucket' => $cloudBucket, 'Key' => $cloudObjectKey]);
+                } catch (Throwable $cleanupError) {
+                    throw new Exception('云端对象校验失败且新上传对象清理失败：' . $cleanupError->getMessage(), 0, $error);
+                }
+            }
+            throw $error;
+        }
+
         $model->update([
             'cloud_storage_setting_id' => $cloudStorageSetting->get('id'),
             'cloud_storage_object_key' => $cloudObjectKey,
         ]);
+    }
+
+    private static function hashObject(S3Client $client, string $bucket, string $key): array
+    {
+        $response = $client->getObject(['Bucket' => $bucket, 'Key' => $key]);
+        $body = $response['Body'];
+        $digest = hash_init('md5');
+        $size = 0;
+        try {
+            while (!$body->eof()) {
+                $chunk = $body->read(1024 * 1024);
+                if ($chunk === '') {
+                    break;
+                }
+                hash_update($digest, $chunk);
+                $size += strlen($chunk);
+            }
+        } finally {
+            $body->close();
+        }
+        return [hash_final($digest), $size];
     }
 
     /**

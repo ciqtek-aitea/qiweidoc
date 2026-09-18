@@ -17,6 +17,10 @@ class RemoveExpiredLocalFilesCron
 
     public function handle()
     {
+        if (getenv('QIWEIDOC_LOCAL_PURGE_ENABLED') !== '1') {
+            return;
+        }
+
         $storages = StorageModel::query()
             ->where(['<', 'local_storage_expired_at', now()])
             ->andWhere(['is_deleted_local' => false])
