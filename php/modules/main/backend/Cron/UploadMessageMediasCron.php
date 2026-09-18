@@ -17,6 +17,11 @@ class UploadMessageMediasCron
 
     public function handle()
     {
+        // 历史对象复制必须单独开启，避免保存云存储配置后立即复制全部存量。
+        if (getenv('QIWEIDOC_CLOUD_BACKFILL_ENABLED') !== '1') {
+            return ExitCode::OK;
+        }
+
         $corp = CorpModel::query()->getOne();
         if (empty($corp)) {
             return ExitCode::OK;

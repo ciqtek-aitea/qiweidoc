@@ -22,6 +22,11 @@ class UploadMessageMediasCommand extends Command
 {
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
+        if (getenv('QIWEIDOC_CLOUD_BACKFILL_ENABLED') !== '1') {
+            $output->writeln('历史云端复制未启用：设置 QIWEIDOC_CLOUD_BACKFILL_ENABLED=1 后再执行');
+            return ExitCode::OK;
+        }
+
         $corp = CorpModel::query()->getOne();
         if (empty($corp)) {
             return ExitCode::OK;

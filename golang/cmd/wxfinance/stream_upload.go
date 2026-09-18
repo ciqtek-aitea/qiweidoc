@@ -2,13 +2,40 @@ package main
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/roadrunner-server/errors"
-	"strings"
+	"hash"
+	"io"
 )
+
+type mediaDigestReader struct {
+	source io.Reader
+	digest hash.Hash
+	size   int64
+}
+
+func newMediaDigestReader(source io.Reader) *mediaDigestReader {
+	return &mediaDigestReader{source: source, digest: md5.New()}
+}
+
+func (reader *mediaDigestReader) Read(buffer []byte) (int, error) {
+	n, err := reader.source.Read(buffer)
+	if n > 0 {
+		_, _ = reader.digest.Write(buffer[:n])
+		reader.size += int64(n)
+	}
+	return n, err
+}
+
+func (reader *mediaDigestReader) MD5() string {
+	return hex.EncodeToString(reader.digest.Sum(nil))
+}
 
 type FetchMediaDataRequest struct {
 	CorpId     string `json:"corp_id"`
@@ -71,59 +98,60 @@ func FetchAndStreamMediaData(input *FetchMediaDataRequest) (*FileInfo, error) {
 	if err != nil {
 		return nil, errors.E(Op, err)
 	}
+	defer sdk.Close()
 
 	err = sdk.Init(input.CorpId, input.ChatSecret)
 	if err != nil {
 		return nil, errors.E(Op, err)
 	}
 
-	streamingReader := NewStreamingReader(sdk, input.SdkFileId, input.Proxy, input.Passwd, input.Timeout)
+	streamingReader := newMediaDigestReader(NewStreamingReader(sdk, input.SdkFileId, input.Proxy, input.Passwd, input.Timeout))
+	return uploadVerifiedMedia(context.TODO(), client, streamingReader, input.StorageBucketName, input.StorageObjectKey)
+}
 
+func uploadVerifiedMedia(ctx context.Context, client *s3.Client, streamingReader *mediaDigestReader, bucket, key string) (*FileInfo, error) {
 	uploader := manager.NewUploader(client)
-	fileUploadInfo, err := uploader.Upload(context.TODO(), &s3.PutObjectInput{
-		Bucket: aws.String(input.StorageBucketName),
-		Key:    aws.String(input.StorageObjectKey),
+	_, err := uploader.Upload(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
 		Body:   streamingReader,
 	})
 	if err != nil {
-		return nil, errors.E(Op, err)
+		return nil, errors.E("uploadVerifiedMedia", err)
 	}
 
-	fileInfo := &FileInfo{
-		Hash: extract32BitETag(*fileUploadInfo.ETag),
-	}
-
-	headOutput, err := client.HeadObject(context.TODO(), &s3.HeadObjectInput{
-		Bucket: aws.String(input.StorageBucketName),
-		Key:    aws.String(input.StorageObjectKey),
+	headOutput, err := client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
 	})
 	if err != nil {
-		return nil, errors.E(Op, err)
+		return nil, errors.E("uploadVerifiedMedia", err)
 	}
 
-	fileInfo.Size = aws.ToInt64(headOutput.ContentLength)
-	fileInfo.Mime = aws.ToString(headOutput.ContentType)
-
-	return fileInfo, nil
-}
-
-func extract32BitETag(etag string) string {
-	// 移除 ETag 开头和结尾的双引号（如果存在）
-	etag = strings.Trim(etag, "\"")
-
-	// 检查是否包含连字符（表示分片上传）
-	if strings.Contains(etag, "-") {
-		// 分片上传的情况，提取连字符前的部分
-		parts := strings.Split(etag, "-")
-		if len(parts) > 0 {
-			return parts[0]
-		}
+	if aws.ToInt64(headOutput.ContentLength) != streamingReader.size {
+		return nil, errors.E("uploadVerifiedMedia", fmt.Errorf("上传后文件大小不一致"))
 	}
 
-	// 如果 ETag 长度为 32，直接返回（标准 MD5）
-	if len(etag) == 32 {
-		return etag
+	object, err := client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, errors.E("uploadVerifiedMedia", err)
+	}
+	defer object.Body.Close()
+	remoteDigest := md5.New()
+	remoteSize, err := io.Copy(remoteDigest, object.Body)
+	if err != nil {
+		return nil, errors.E("uploadVerifiedMedia", err)
+	}
+	if remoteSize != streamingReader.size || hex.EncodeToString(remoteDigest.Sum(nil)) != streamingReader.MD5() {
+		return nil, errors.E("uploadVerifiedMedia", fmt.Errorf("上传后文件内容校验失败"))
 	}
 
-	return etag
+	return &FileInfo{
+		Hash: streamingReader.MD5(),
+		Size: remoteSize,
+		Mime: aws.ToString(headOutput.ContentType),
+	}, nil
 }
