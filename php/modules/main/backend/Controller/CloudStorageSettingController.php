@@ -14,6 +14,7 @@ use Modules\Main\Model\CloudStorageSettingModel;
 use Modules\Main\Model\SettingModel;
 use Modules\Main\Model\UserModel;
 use Modules\Main\Service\AuthService;
+use Modules\Main\Service\CloudStorageCredentialGuard;
 use Modules\Main\Service\StorageService;
 use Psr\Http\Message\ServerRequestInterface;
 use Throwable;
@@ -25,7 +26,10 @@ class CloudStorageSettingController extends BaseController
 {
     public function show(ServerRequestInterface $request, RouteCollectionInterface $collection)
     {
+        $this->assertSuperAdmin($request);
+
         $result = CloudStorageSettingModel::query()->orderBy(['id' => SORT_DESC])->getOne()?->toArray() ?: [];
+        $result = CloudStorageCredentialGuard::redact($result);
         $result['local_session_file_retention_days'] = (int)SettingModel::getValue('local_session_file_retention_days') ?: 0;
 
         return $this->jsonResponse($result);
@@ -33,11 +37,7 @@ class CloudStorageSettingController extends BaseController
 
     public function save(ServerRequestInterface $request)
     {
-        /** @var UserModel $user */
-        $user = $request->getAttribute(Authentication::class);
-        if ($user->get('role_id') != EnumUserRoleType::SUPPER_ADMIN->value) {
-            throw new LogicException("没有权限");
-        }
+        $this->assertSuperAdmin($request);
 
         $dto = new CloudStorageSettingDTO($request->getParsedBody());
 
@@ -49,13 +49,27 @@ class CloudStorageSettingController extends BaseController
                     'bucket' => $dto->get('bucket'),
                 ])->getOne();
 
+                $accessKey = CloudStorageCredentialGuard::resolve(
+                    $dto->get('access_key'),
+                    $setting?->get('access_key'),
+                    'AccessKey ID'
+                );
+                $secretKey = CloudStorageCredentialGuard::resolve(
+                    $dto->get('secret_key'),
+                    $setting?->get('secret_key'),
+                    'AccessKey Secret'
+                );
+
                 if (empty($setting)) {
-                    $setting = CloudStorageSettingModel::create($dto->toArray());
+                    $setting = CloudStorageSettingModel::create(array_replace($dto->toArray(), [
+                        'access_key' => $accessKey,
+                        'secret_key' => $secretKey,
+                    ]));
                 } else {
                     $setting->update([
                         'endpoint' => $dto->get('endpoint'),
-                        'access_key' => $dto->get('access_key'),
-                        'secret_key' => $dto->get('secret_key'),
+                        'access_key' => $accessKey,
+                        'secret_key' => $secretKey,
                     ]);
                 }
 
@@ -97,6 +111,15 @@ class CloudStorageSettingController extends BaseController
         SettingModel::setValue('local_session_file_retention_days', $dto->get('local_session_file_retention_days'));
 
         return $this->jsonResponse();
+    }
+
+    private function assertSuperAdmin(ServerRequestInterface $request): void
+    {
+        /** @var UserModel $user */
+        $user = $request->getAttribute(Authentication::class);
+        if ($user->get('role_id') != EnumUserRoleType::SUPPER_ADMIN->value) {
+            throw new LogicException("没有权限");
+        }
     }
 
     /**
