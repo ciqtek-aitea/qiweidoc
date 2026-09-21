@@ -178,6 +178,28 @@ class StorageService
             throw new Exception('存储记录缺少合法 MD5 或文件大小');
         }
         $cloudClient = self::getCloudS3Client($cloudStorageSetting);
+
+        // 多条消息可能引用同一个本地对象。若该源对象已有一条记录完成了云端
+        // 逐字节校验，则直接复用其云端定位，避免再次读取和上传同一大文件。
+        $sourceVerified = StorageModel::query()->where([
+            'local_storage_bucket' => $localBucket,
+            'local_storage_object_key' => $localKey,
+            'file_size' => $size,
+            'cloud_storage_setting_id' => $cloudStorageSetting->get('id'),
+        ])->getOne();
+        if ($sourceVerified !== null && $sourceVerified->get('cloud_storage_object_key')) {
+            $sourceCloudKey = (string)$sourceVerified->get('cloud_storage_object_key');
+            $head = $cloudClient->headObject(['Bucket' => $cloudBucket, 'Key' => $sourceCloudKey]);
+            if ((int)$head['ContentLength'] !== $size) {
+                throw new Exception('同源云端对象的大小不一致，停止关联');
+            }
+            $model->update([
+                'cloud_storage_setting_id' => $cloudStorageSetting->get('id'),
+                'cloud_storage_object_key' => $sourceCloudKey,
+            ]);
+            return;
+        }
+
         $savedHashKey = sprintf('content/md5/%s/%s', substr($savedHash, 0, 2), $savedHash);
         $verified = StorageModel::query()->where([
             'hash' => $model->get('hash'),

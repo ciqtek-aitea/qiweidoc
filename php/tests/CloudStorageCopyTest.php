@@ -175,12 +175,22 @@ namespace {
         'id' => 4, 'hash' => md5('multipart ETag prefix'),
         'local_storage_object_key' => 'legacy',
     ]));
+    \Test\State::$storages[] = $legacy;
     \Test\State::$objects['http://local.test/session/legacy'] = $content;
     \Modules\Main\Service\StorageService::saveCloud($legacy);
     \Test\expect($legacy->get('hash') === md5('multipart ETag prefix'), 'legacy message reference remains unchanged');
     \Test\expect($legacy->get('cloud_storage_object_key') === $cloudKey, 'legacy row uses actual content MD5 key');
     $wrongKey = 'content/md5/' . substr($legacy->get('hash'), 0, 2) . '/' . $legacy->get('hash');
     \Test\expect(!isset(\Test\State::$objects['https://cloud.test/private/' . $wrongKey]), 'legacy hash creates no wrong-key object');
+
+    $legacyDuplicate = new \Modules\Main\Model\StorageModel(array_replace($legacy->values, [
+        'id' => 6, 'cloud_storage_setting_id' => 0, 'cloud_storage_object_key' => '',
+    ]));
+    \Test\State::$storages[] = $legacyDuplicate;
+    $reads = \Test\State::$localReads;
+    \Modules\Main\Service\StorageService::saveCloud($legacyDuplicate);
+    \Test\expect($legacyDuplicate->get('cloud_storage_object_key') === $cloudKey, 'same local source reuses actual cloud hash');
+    \Test\expect(\Test\State::$localReads === $reads, 'same local source is not downloaded again');
 
     $broken = new \Modules\Main\Model\StorageModel(array_replace($values, [
         'id' => 5, 'hash' => md5('broken saved hash'),
