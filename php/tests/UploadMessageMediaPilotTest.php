@@ -59,6 +59,16 @@ namespace Modules\Main\Service {
                 'cloud_storage_object_key' => 'content/md5/aa/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
             ]);
         }
+        public static function verifyCloud(\Modules\Main\Model\StorageModel $storage): array
+        {
+            if (!$storage->get('cloud_storage_object_key')) throw new \RuntimeException('not linked');
+            return [
+                'object_key' => $storage->get('cloud_storage_object_key'),
+                'size' => (int)$storage->get('file_size'),
+                'md5' => str_repeat('a', 32),
+                'sha256' => str_repeat('b', 64),
+            ];
+        }
     }
 }
 
@@ -93,6 +103,10 @@ namespace {
     \Pilot\check($storage->get('cloud_storage_setting_id') === 9 && $storage->get('cloud_storage_object_key'), 'successful copy records cloud location');
     \Pilot\check($tester->execute(['--storage-id' => '17', '--execute' => true]) === 0, 'already linked storage remains idempotent');
     \Pilot\check(\Pilot\State::$copies === 1, 'retry creates no second copy');
+    \Pilot\check($tester->execute(['--storage-id' => '17', '--verify-cloud' => true]) === 0, 'linked cloud object can be verified read-only');
+    \Pilot\check(str_contains($tester->getDisplay(), str_repeat('b', 64)), 'cloud verification prints SHA-256');
+    \Pilot\check($tester->execute(['--storage-id' => '17', '--execute' => true, '--verify-cloud' => true]) !== 0, 'copy and verification are mutually exclusive');
+    \Pilot\check($tester->execute(['--verify-cloud' => true]) !== 0, 'cloud verification requires one exact storage ID');
     \Pilot\check($tester->execute(['--storage-id' => '18', '--execute' => true]) !== 0, 'missing storage ID cannot be copied');
     \Pilot\check($tester->execute(['--storage-id' => 'bad', '--execute' => true]) !== 0, 'invalid storage ID is rejected');
     \Pilot\check($tester->execute(['--execute' => true]) !== 0, 'execution requires one exact storage ID');

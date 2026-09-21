@@ -26,12 +26,22 @@ class UploadMessageMediasCommand extends Command
     {
         $this->addOption('storage-id', null, InputOption::VALUE_REQUIRED, '仅检查指定 storage ID；默认不复制');
         $this->addOption('execute', null, InputOption::VALUE_NONE, '复制指定 storage ID，另需 QIWEIDOC_CLOUD_COPY_ENABLED=1');
+        $this->addOption('verify-cloud', null, InputOption::VALUE_NONE, '只读校验指定 storage ID 的云端字节');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $storageIdOption = $input->getOption('storage-id');
         $execute = (bool)$input->getOption('execute');
+        $verifyCloud = (bool)$input->getOption('verify-cloud');
+        if ($execute && $verifyCloud) {
+            $output->writeln('--execute 与 --verify-cloud 不能同时使用');
+            return Command::FAILURE;
+        }
+        if ($verifyCloud && $storageIdOption === null) {
+            $output->writeln('云端校验必须指定 --storage-id');
+            return Command::FAILURE;
+        }
         if ($execute && $storageIdOption === null) {
             $output->writeln('单对象复制必须指定 --storage-id');
             return Command::FAILURE;
@@ -56,6 +66,17 @@ class UploadMessageMediasCommand extends Command
                 $storage->get('cloud_storage_setting_id') && $storage->get('cloud_storage_object_key') ? '已关联' : '未关联',
             ));
             if (!$execute) {
+                if ($verifyCloud) {
+                    $result = StorageService::verifyCloud($storage);
+                    $output->writeln(json_encode([
+                        'storage_id' => (int)$storage->get('id'),
+                        'object_key' => $result['object_key'],
+                        'size' => $result['size'],
+                        'md5' => $result['md5'],
+                        'sha256' => $result['sha256'],
+                    ], JSON_UNESCAPED_SLASHES));
+                    return ExitCode::OK;
+                }
                 $output->writeln('仅预览；未复制对象');
                 return ExitCode::OK;
             }

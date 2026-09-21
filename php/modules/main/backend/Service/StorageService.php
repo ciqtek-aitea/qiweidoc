@@ -293,9 +293,41 @@ class StorageService
 
     private static function hashObject(S3Client $client, string $bucket, string $key): array
     {
+        $digests = self::hashObjectDigests($client, $bucket, $key);
+        return [$digests['md5'], $digests['size']];
+    }
+
+    /**
+     * 只读校验已关联的云端对象。
+     */
+    public static function verifyCloud(StorageModel $model): array
+    {
+        $settingId = (int)$model->get('cloud_storage_setting_id');
+        $objectKey = (string)$model->get('cloud_storage_object_key');
+        if ($settingId <= 0 || $objectKey === '') {
+            throw new Exception('存储记录尚未关联云端对象');
+        }
+        $setting = CloudStorageSettingModel::query()->where(['id' => $settingId])->getOne();
+        if ($setting === null) {
+            throw new Exception('云存储配置不存在');
+        }
+        $digests = self::hashObjectDigests(
+            self::getCloudS3Client($setting),
+            (string)$setting->get('bucket'),
+            $objectKey,
+        );
+        if ($digests['size'] !== (int)$model->get('file_size')) {
+            throw new Exception('云端对象大小与数据库不一致');
+        }
+        return $digests + ['object_key' => $objectKey];
+    }
+
+    private static function hashObjectDigests(S3Client $client, string $bucket, string $key): array
+    {
         $response = $client->getObject(['Bucket' => $bucket, 'Key' => $key]);
         $body = $response['Body'];
-        $digest = hash_init('md5');
+        $md5Digest = hash_init('md5');
+        $sha256Digest = hash_init('sha256');
         $size = 0;
         try {
             while (!$body->eof()) {
@@ -303,13 +335,18 @@ class StorageService
                 if ($chunk === '') {
                     break;
                 }
-                hash_update($digest, $chunk);
+                hash_update($md5Digest, $chunk);
+                hash_update($sha256Digest, $chunk);
                 $size += strlen($chunk);
             }
         } finally {
             $body->close();
         }
-        return [hash_final($digest), $size];
+        return [
+            'md5' => hash_final($md5Digest),
+            'sha256' => hash_final($sha256Digest),
+            'size' => $size,
+        ];
     }
 
     /**
