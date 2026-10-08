@@ -148,6 +148,11 @@ class Routes extends RouterProvider
     {
         return [
             // 企微域名验证
+            // Same public session links as MinIO; cloud signatures are renewed
+            // on each access, including links in historical exports.
+            Route::methods([Method::GET, Method::HEAD], '/api/storage-legacy/session/{key:.+}')
+                ->action([StorageController::class, 'legacySessionDownload']),
+
             Route::get("/WW_verify_{content:.+\.txt}")->action(function (
                 ServerRequestInterface $request,
                 #[RouteArgument('content')]

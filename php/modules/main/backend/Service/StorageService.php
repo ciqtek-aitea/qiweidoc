@@ -354,6 +354,36 @@ class StorageService
      * 默认生成本地存储的下载链接
      * 如果本地文件已过期则取云存储的下载链接
      */
+    public static function getLegacySessionCloudUrl(string $key, string $method = 'GET'): string
+    {
+        // Historical exports used public session keys. Never accept a bucket or
+        // cloud key from the caller, or turn this into a general object signer.
+        if (!in_array($method, ['GET', 'HEAD'], true)
+            || !preg_match('~^[0-9A-Za-z/_-]+\.[0-9A-Za-z]+$~D', $key)
+            || str_contains($key, '//')) {
+            return '';
+        }
+        $storage = StorageModel::query()->where([
+            'local_storage_bucket' => 'session',
+            'local_storage_object_key' => $key,
+        ])->orderBy(['id' => SORT_DESC])->getOne();
+        if (!$storage || !$storage->get('cloud_storage_object_key')) {
+            return '';
+        }
+        $setting = CloudStorageSettingModel::query()->where([
+            'id' => $storage->get('cloud_storage_setting_id'),
+        ])->getOne();
+        if (!$setting) {
+            return '';
+        }
+        $client = self::getCloudS3Client($setting);
+        $command = $client->getCommand($method === 'HEAD' ? 'HeadObject' : 'GetObject', [
+            'Bucket' => $setting->get('bucket'),
+            'Key' => $storage->get('cloud_storage_object_key'),
+        ]);
+        return (string)$client->createPresignedRequest($command, '+1 hour')->getUri();
+    }
+
     public static function getDownloadUrl(string $hash): string
     {
         $storage = StorageModel::query()->where(['hash' => $hash])->orderBy(['id' => SORT_DESC])->getOne();
