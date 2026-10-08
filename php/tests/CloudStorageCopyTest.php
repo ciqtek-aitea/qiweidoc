@@ -69,6 +69,17 @@ namespace Aws\S3 {
     {
         private string $endpoint;
         public function __construct(array $options) { $this->endpoint = $options['endpoint']; }
+        public function getCommand(string $name, array $request): array { return [$name, $request]; }
+        public function createPresignedRequest(array $command, string $expires): object
+        {
+            return new class($this->endpoint, $command) {
+                public function __construct(private string $endpoint, private array $command) {}
+                public function getUri(): string {
+                    [$method, $request] = $this->command;
+                    return $this->endpoint . '/' . $request['Bucket'] . '/' . $request['Key'] . '?method=' . $method;
+                }
+            };
+        }
         private function key(string $bucket, string $key): string { return $this->endpoint . '/' . $bucket . '/' . $key; }
         public function doesObjectExistV2(string $bucket, string $key): bool
         {
@@ -213,4 +224,16 @@ namespace {
     $first->update(['local_storage_expired_at' => '2020-01-01 00:00:00']);
     \Modules\Main\Service\StorageService::removeExpiredLocalFile($first);
     \Test\expect(isset(\Test\State::$objects['http://local.test/session/first']), 'local purge stays off by default');
+
+    $first->update(['local_storage_object_key' => '2026/09/01/abc/file.pdf']);
+    $url = \Modules\Main\Service\StorageService::getLegacySessionCloudUrl('2026/09/01/abc/file.pdf');
+    \Test\expect($url === 'https://cloud.test/private/' . $cloudKey . '?method=GetObject', 'historical session link resolves cloud key before purge');
+    $first->update(['is_deleted_local' => true]);
+    \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('2026/09/01/abc/file.pdf') === $url, 'historical session link works after purge');
+    \Test\expect(str_ends_with(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('2026/09/01/abc/file.pdf', 'HEAD'), '?method=HeadObject'), 'HEAD signs a HEAD request');
+    \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('unknown.pdf') === '', 'unindexed key cannot sign an arbitrary cloud object');
+    \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('../file.pdf') === '', 'traversal rejected');
+    \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('2026/09/01/abc/file.pdf', 'POST') === '', 'unsupported method rejected');
+    $first->update(['local_storage_bucket' => 'default']);
+    \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('2026/09/01/abc/file.pdf') === '', 'legacy signer restricted to public session bucket');
 }
