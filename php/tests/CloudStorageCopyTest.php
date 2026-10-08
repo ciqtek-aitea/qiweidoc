@@ -234,6 +234,11 @@ namespace {
     \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('unknown.pdf') === '', 'unindexed key cannot sign an arbitrary cloud object');
     \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('../file.pdf') === '', 'traversal rejected');
     \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('2026/09/01/abc/file.pdf', 'POST') === '', 'unsupported method rejected');
+    $first->update(['local_storage_object_key' => '2026/09/01/abc/中文 文件(1)#2.v1.pdf']);
+    \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('2026/09/01/abc/中文 文件(1)#2.v1.pdf') === $url, 'Unicode, spaces and punctuation preserve exact historical key');
+    \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl("2026/09/file\n.pdf") === '', 'control characters rejected');
+    \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('2026\\09\\file.pdf') === '', 'backslashes rejected');
+    $first->update(['local_storage_object_key' => '2026/09/01/abc/file.pdf']);
     $first->update(['local_storage_bucket' => 'default']);
     \Test\expect(\Modules\Main\Service\StorageService::getLegacySessionCloudUrl('2026/09/01/abc/file.pdf') === '', 'legacy signer restricted to public session bucket');
 }

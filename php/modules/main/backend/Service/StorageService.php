@@ -359,8 +359,9 @@ class StorageService
         // Historical exports used public session keys. Never accept a bucket or
         // cloud key from the caller, or turn this into a general object signer.
         if (!in_array($method, ['GET', 'HEAD'], true)
-            || !preg_match('~^[0-9A-Za-z/_-]+\.[0-9A-Za-z]+$~D', $key)
-            || str_contains($key, '//')) {
+            || $key === '' || strlen($key) > 2048
+            || preg_match('~[\x00-\x1f\x7f\\\\]~', $key)
+            || array_intersect(explode('/', $key), ['', '.', '..'])) {
             return '';
         }
         $storage = StorageModel::query()->where([
